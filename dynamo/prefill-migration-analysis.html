@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Prefill + Migration 联合时序分析（打印版）</title>
+  <style>
+    :root {
+      --bg: #ffffff;
+      --panel: #ffffff;
+      --text: #111827;
+      --muted: #4b5563;
+      --accent: #2563eb;
+      --line: #d1d5db;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC",
+                   "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.55;
+    }
+    .container {
+      max-width: 1024px;
+      margin: 0 auto;
+      padding: 26px 20px 38px;
+    }
+    h1, h2, h3 {
+      margin: 0 0 10px;
+      line-height: 1.25;
+      page-break-after: avoid;
+    }
+    h1 { font-size: 28px; }
+    h2 { font-size: 21px; margin-top: 28px; }
+    h3 { font-size: 17px; margin-top: 20px; }
+    p { margin: 6px 0 10px; color: var(--muted); }
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 14px;
+      margin-top: 10px;
+      page-break-inside: avoid;
+      background: var(--panel);
+    }
+    ul { margin: 6px 0 6px 20px; padding: 0; }
+    li { margin: 5px 0; }
+    code {
+      background: #f3f4f6;
+      border: 1px solid #e5e7eb;
+      border-radius: 5px;
+      padding: 1px 5px;
+      color: #111827;
+    }
+    .mermaid {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      overflow-x: auto;
+      background: #fff;
+    }
+    .fallback {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre-wrap;
+      font-size: 13px;
+      color: #1f2937;
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: #fafafa;
+    }
+    .footer {
+      margin-top: 24px;
+      padding-top: 10px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 13px;
+    }
+    @media print {
+      body { background: #fff; }
+      .container { max-width: none; padding: 10mm; }
+      .card, .mermaid, .fallback { break-inside: avoid; }
+      a[href]:after { content: ""; }
+    }
+  </style>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "base",
+      securityLevel: "loose",
+      sequence: { showSequenceNumbers: true }
+    });
+  </script>
+</head>
+<body>
+  <div class="container">
+    <h1>Prefill + Migration 联合时序分析（打印版）</h1>
+    <p>
+      用于回顾 <code>prefill_op</code> 与 <code>migration</code> 的协同流程，
+      重点关注 <strong>decode 流中断后的迁移重建</strong>。
+    </p>
+
+    <h2>1) 联合时序图</h2>
+    <div class="card">
+      <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant U as 上游调用方(HTTP/SSE)
+    participant M as Migration(RetryManager)
+    participant P as PrefillRouter(prefill_op)
+    participant Wp as Prefill Worker
+    participant Wd1 as Decode Worker #1
+    participant Wd2 as Decode Worker #2
+
+    U->>M: generate(request)
+    M->>M: 创建 RetryManager(重试额度/状态追踪)
+    M->>P: next.generate(request) (首次建流)
+
+    Note over P: 先做 prefill，再进入 decode
+    alt 异步 bootstrap prefill
+        P->>Wp: 发起 prefill(后台)
+        P->>P: 先构造 decode_req(带 bootstrap_info 占位)
+    else 同步 prefill
+        P->>Wp: 执行 prefill
+        Wp-->>P: 返回 prefill_result(disaggregated_params)
+        P->>P: 注入 decode_req + decode_router_override
+    end
+
+    P->>Wd1: 启动 decode 流
+    Wd1-->>M: chunk1/chunk2/...
+    M-->>U: 透传输出(并持续 track 已生成状态)
+
+    Note over Wd1,M: 运行中发生断连/EngineShutdown(可迁移错误)
+    Wd1--x M: error (migratable)
+    M->>M: 减少 retries_left + 用已跟踪状态重建请求
+    M->>P: next.generate(rebuilt_request) (重建新流)
+
+    Note over P: 重建时通常跳过重复 prefill影响，继续 decode 路由
+    P->>Wd2: 启动新的 decode 流(带 override，避免错误复用统计)
+    Wd2-->>M: chunkK/chunkK+1/...
+    M-->>U: 继续输出(对上游看起来是同一条 ResponseStream)
+
+    alt 正常结束
+        Wd2-->>M: None(end of stream)
+        M-->>U: 流结束
+    else 再次失败且额度耗尽/不可迁移
+        Wd2--x M: error
+        M-->>U: 返回最终错误并结束
+    end
+      </div>
+    </div>
+
+    <h2>2) RetryManager::next() 四态图</h2>
+    <div class="card">
+      <div class="mermaid">
+stateDiagram-v2
+    [*] --> S1: 首次调用 next()
+    S1: S1 建流/拿流
+    S2: S2 正常读流
+    S3: S3 发生可迁移错误后重建流
+    S4: S4 终止(成功结束或重试耗尽)
+
+    S1 --> S2: 下游 stream 创建成功
+    S1 --> S3: 建流失败 且 error 可迁移 且 retries_left > 0
+    S1 --> S4: 建流失败但不可迁移/无重试额度
+
+    S2 --> S2: 读取到正常 chunk 并向上游 yield
+    S2 --> S4: 读取到 None(自然结束)
+    S2 --> S3: 读取到可迁移错误 且 retries_left > 0
+    S2 --> S4: 不可迁移错误 或 重试耗尽
+
+    S3 --> S2: 用已跟踪状态重建请求并建流成功
+    S3 --> S3: 再次失败但仍可迁移且还有额度
+    S3 --> S4: 重建失败且不可迁移/无额度
+      </div>
+    </div>
+
+    <h2>3) 结论速记</h2>
+    <div class="card">
+      <ul>
+        <li><strong>职责边界：</strong><code>Migration</code> 负责流重试与迁移，不负责模型推理本身。</li>
+        <li><strong>关键抽象：</strong><code>ResponseStream(unfold(retry_manager.next()))</code> 把迁移状态机暴露成统一流接口。</li>
+        <li><strong>上游体验：</strong>上游持续消费同一条响应流，无需感知内部 worker 重连。</li>
+        <li><strong>迁移判定：</strong>满足“可迁移错误 + 仍有重试额度”时进入重建流。</li>
+        <li><strong>结束条件：</strong>自然结束、不可迁移错误、或重试耗尽。</li>
+      </ul>
+    </div>
+
+    <h2>4) Mermaid 不可用时备用文本</h2>
+    <div class="fallback">U -> M: generate(request)
+M -> P: next.generate(request) 首次建流
+P -> Wp: prefill（异步 bootstrap 或 同步 prefill）
+P -> Wd1: decode 流
+Wd1 -> M: chunk...
+M -> U: 透传 + track 状态
+Wd1 -x M: migratable error
+M -> M: 重试计数减少 + 重建请求
+M -> P: next.generate(rebuilt_request)
+P -> Wd2: 新 decode 流
+Wd2 -> M -> U: 继续输出
+最终: 正常结束 or 不可迁移/重试耗尽后结束</div>
+
+    <div class="footer">
+      打印建议：浏览器中选择“打印” -> “另存为 PDF”，保留背景图形可提升图表可读性。
+    </div>
+  </div>
+</body>
+</html>
