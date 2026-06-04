@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Dynamo 架构梳理</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #ffffff;
+    --panel: #f6f8fa;
+    --border: #d0d7de;
+    --text: #1f2328;
+    --muted: #656d76;
+    --accent: #0969da;
+    --accent2: #1a7f37;
+    --accent3: #9a6700;
+    --code-bg: #f0f3f6;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+      "Hiragino Sans GB", "Microsoft YaHei", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.7;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 40px 24px 80px; }
+  header {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 24px;
+    margin-bottom: 8px;
+  }
+  h1 {
+    font-size: 2rem;
+    margin: 0 0 8px;
+    background: linear-gradient(90deg, #0969da, #1a7f37);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .sub { color: var(--muted); font-size: 0.95rem; }
+  h2 {
+    font-size: 1.4rem;
+    margin: 48px 0 12px;
+    padding-left: 12px;
+    border-left: 4px solid var(--accent);
+  }
+  h3 { font-size: 1.1rem; color: var(--accent2); margin: 28px 0 8px; }
+  p { margin: 10px 0; }
+  code {
+    background: var(--code-bg);
+    padding: 2px 6px;
+    border-radius: 5px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.88em;
+    color: #bc4c00;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px 24px;
+    margin: 16px 0;
+  }
+  .mermaid {
+    background: #ffffff;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    margin: 16px 0;
+    text-align: center;
+    overflow-x: auto;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0;
+    font-size: 0.9rem;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: 8px 12px;
+    text-align: left;
+  }
+  th { background: #eaeef2; color: var(--accent); }
+  tr:nth-child(even) td { background: #f6f8fa; }
+  .toc {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 24px;
+    margin: 20px 0 8px;
+  }
+  .toc ol { margin: 6px 0; padding-left: 22px; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .tag {
+    display: inline-block;
+    font-size: 0.72rem;
+    padding: 1px 8px;
+    border-radius: 999px;
+    margin-left: 6px;
+    vertical-align: middle;
+  }
+  .tag-rust { background: #fff1e5; color: #bc4c00; border: 1px solid #f0c9a8; }
+  .tag-py { background: #ddf4ff; color: #0969da; border: 1px solid #a5d6ff; }
+  .tag-go { background: #dafbe1; color: #1a7f37; border: 1px solid #a0e6b0; }
+  footer {
+    margin-top: 60px;
+    border-top: 1px solid var(--border);
+    padding-top: 20px;
+    color: var(--muted);
+    font-size: 0.85rem;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>NVIDIA Dynamo 架构梳理</h1>
+    <div class="sub">数据中心级分布式 LLM 推理编排栈 &nbsp;·&nbsp; Rust 核心 + Python 扩展 + K8s 编排</div>
+  </header>
+
+  <div class="toc">
+    <strong>目录</strong>
+    <ol>
+      <li><a href="#layout">顶层目录布局</a></li>
+      <li><a href="#crates">lib/ —— Rust 核心库与 crate 依赖</a></li>
+      <li><a href="#pipeline">lib/llm —— LLM 请求 pipeline</a></li>
+      <li><a href="#components">components/ —— Python 入口与引擎适配</a></li>
+      <li><a href="#planes">数据面 vs 控制面（全景）</a></li>
+      <li><a href="#deploy">部署链路：CRD / Helm / Operator / Pod</a></li>
+      <li><a href="#glossary">术语速查</a></li>
+    </ol>
+  </div>
+
+  <!-- 1 -->
+  <h2 id="layout">1. 顶层目录布局</h2>
+  <p>定位口径：<strong>Rust 在 <code>lib/</code> 提供运行时和 LLM pipeline，Python 在 <code>components/</code> 做胶水 + 引擎适配，Go/Helm 在 <code>deploy/</code> 做 K8s 编排</strong>。</p>
+  <div class="mermaid">
+flowchart TD
+    ROOT["dynamo/ 仓库根"]
+    ROOT --> LIB["lib/<br/>Rust 核心库（性能关键路径）"]
+    ROOT --> COMP["components/<br/>Python 组件入口 python -m dynamo.*"]
+    ROOT --> DEP["deploy/<br/>K8s Operator / Helm / Gateway"]
+    ROOT --> REC["recipes/<br/>各模型 K8s 部署模板"]
+    ROOT --> EX["examples/ · benchmarks/ · docs/ · container/ · tests/"]
+
+    classDef rust fill:#fff1e5,stroke:#bc4c00,color:#3d1d00;
+    classDef py fill:#ddf4ff,stroke:#0969da,color:#03285e;
+    classDef go fill:#dafbe1,stroke:#1a7f37,color:#03311a;
+    classDef misc fill:#f0f3f6,stroke:#8b949e,color:#1f2328;
+    class LIB rust;
+    class COMP py;
+    class DEP go;
+    class REC,EX misc;
+  </div>
+
+  <!-- 2 -->
+  <h2 id="crates">2. lib/ —— Rust 核心库与 crate 依赖</h2>
+  <p>每个目录都带有自己的 <code>Cargo.toml</code>，因此都是一个独立 <strong>crate</strong>，由根 <code>Cargo.toml</code> 的 workspace 统一管理。依赖方向自底向上：</p>
+  <div class="mermaid">
+flowchart BT
+    RUNTIME["dynamo-runtime<br/>分布式运行时 · AsyncEngine · pipeline · 服务发现"]
+    PROTO["dynamo-protocols<br/>跨进程消息协议"]
+    TOK["dynamo-tokenizers / tokens"]
+    PARSERS["dynamo-parsers<br/>tool-calling / reasoning"]
+    MEM["dynamo-memory<br/>NIXL / 共享内存"]
+    KVR["dynamo-kv-router<br/>KV-aware 路由（独立 crate）"]
+    KVBM["kvbm-logical / physical / kernels / engine<br/>KV Block Manager 多层缓存"]
+    LLM["dynamo-llm<br/>LLM pipeline（最大 crate）"]
+    BIND["lib/bindings/python<br/>PyO3 绑定 → Python 包"]
+
+    PROTO --> LLM
+    RUNTIME --> LLM
+    TOK --> LLM
+    PARSERS --> LLM
+    MEM --> LLM
+    KVR --> LLM
+    KVBM --> LLM
+    RUNTIME --> KVR
+    LLM --> BIND
+    RUNTIME --> BIND
+
+    classDef base fill:#f0f3f6,stroke:#8b949e,color:#1f2328;
+    classDef hot fill:#fff1e5,stroke:#bc4c00,color:#3d1d00;
+    classDef py fill:#ddf4ff,stroke:#0969da,color:#03285e;
+    class RUNTIME,PROTO,TOK,PARSERS,MEM,KVR,KVBM base;
+    class LLM hot;
+    class BIND py;
+  </div>
+  <div class="card">
+    <strong>易混点：crate vs module</strong><br/>
+    <code>dynamo-kv-router</code>（<code>lib/kv-router</code>）是<strong>独立 crate</strong>，可被任何项目单独依赖；
+    而 <code>lib/llm/src/kv_router</code> 是 <code>dynamo-llm</code> crate <strong>内部的 module</strong>。前者被后者依赖。
+  </div>
+
+  <!-- 3 -->
+  <h2 id="pipeline">3. lib/llm —— LLM 请求 pipeline</h2>
+  <p>一次请求在 Rust 侧的流向：每一层都实现 <code>AsyncEngine</code> trait，被串成 pipeline；上游只认 <code>Arc&lt;dyn AsyncEngine&gt;</code>，不关心下游具体是哪个引擎。</p>
+  <div class="mermaid">
+flowchart LR
+    CLIENT(["client"]) -->|OpenAI JSON| HTTP["http / grpc<br/>OpenAI 兼容入口"]
+    HTTP --> PRE["preprocessor<br/>模板渲染 + 分词 + 多模态"]
+    PRE --> ROUTER["kv_router<br/>选 worker（KV 重叠 + 负载）"]
+    ROUTER --> MIG["migration<br/>失败自动重路由（容错）"]
+    MIG --> BACKEND["backend engine<br/>vLLM / SGLang / TRT-LLM worker"]
+    BACKEND -->|KV blocks| KVBM["block_manager (KVBM)<br/>GPU↔CPU↔SSD↔远端 多层缓存"]
+    BACKEND -.响应流.-> DETOK["backend.rs<br/>detokenize + 合并增量"]
+    DETOK -.stream.-> CLIENT
+
+    classDef hot fill:#fff1e5,stroke:#bc4c00,color:#3d1d00;
+    classDef io fill:#ddf4ff,stroke:#0969da,color:#03285e;
+    class HTTP,PRE,ROUTER,MIG,DETOK hot;
+    class BACKEND,KVBM io;
+  </div>
+  <table>
+    <tr><th>模块</th><th>职责</th><th>关键文件</th></tr>
+    <tr><td><code>http</code></td><td>OpenAI JSON → 内部 Request</td><td>lib/llm/src/http/</td></tr>
+    <tr><td><code>preprocessor</code></td><td>Request → PreprocessedRequest（token_ids、多模态 tensor）</td><td>preprocessor.rs</td></tr>
+    <tr><td><code>kv_router</code></td><td>按 KV 缓存重叠 + 负载选中 worker</td><td>kv_router/{indexer,scheduler,push_router}.rs</td></tr>
+    <tr><td><code>migration</code></td><td>遇到可迁移错误自动换 worker 重试</td><td>migration.rs</td></tr>
+    <tr><td><code>backend</code></td><td>反向 detokenize、合并流式增量</td><td>backend.rs</td></tr>
+    <tr><td><code>block_manager</code></td><td>KVBM 多层 KV 缓存管理</td><td>block_manager/ + lib/kvbm-*</td></tr>
+  </table>
+
+  <!-- 4 -->
+  <h2 id="components">4. components/ —— Python 入口与引擎适配</h2>
+  <p>每个目录是一个 <code>python -m dynamo.&lt;name&gt;</code> 可执行模块。Frontend 只是壳，真正的 HTTP / preprocessor / router 都在 Rust 里，经 PyO3 绑定拉起。</p>
+  <div class="mermaid">
+flowchart TD
+    CLIENT(["client"]) -->|HTTP| FE["python -m dynamo.frontend<br/>HTTP + preprocessor + router"]
+    FE <-->|etcd / K8s 服务发现| DISC{{"discovery"}}
+    FE -->|TCP / NATS| W1["dynamo.vllm"]
+    FE -->|TCP / NATS| W2["dynamo.sglang"]
+    FE -->|TCP / NATS| W3["dynamo.trtllm"]
+    W1 -.注册.-> DISC
+    W2 -.注册.-> DISC
+    W3 -.注册.-> DISC
+
+    PLAN["dynamo.planner<br/>SLA / load 自动扩缩容"] -->|调 K8s API 调整副本| W1
+    PROF["dynamo.profiler<br/>离线性能 profiling"] -->|profile 数据| PLAN
+    PLAN -.订阅 metrics.-> FE
+
+    classDef py fill:#ddf4ff,stroke:#0969da,color:#03285e;
+    classDef ctrl fill:#fff8c5,stroke:#9a6700,color:#3d2e00;
+    class FE,W1,W2,W3 py;
+    class PLAN,PROF ctrl;
+  </div>
+  <p>三个 worker（<code>vllm</code> / <code>sglang</code> / <code>trtllm</code>）结构一致：<code>main.py / args.py / publisher.py / handlers.py / engine.py / request_handlers/</code>，都是把对应引擎包成实现 <code>AsyncEngine</code> 的 worker，再注册到 etcd 让 frontend 发现。</p>
+
+  <!-- 5 -->
+  <h2 id="planes">5. 数据面 vs 控制面（全景）</h2>
+  <div class="mermaid">
+flowchart TB
+    subgraph CTRL["控制面 control plane"]
+        direction TB
+        YAML["user.yaml<br/>kind: DynamoGraphDeployment / DGDR"]
+        OP["deploy/operator (Go)<br/>监听 CRD → reconcile"]
+        PLAN2["dynamo.planner + profiler<br/>SLA 闭环扩缩容"]
+        YAML --> OP
+        OP -->|K8s API 拉起 Pod| PODS["frontend / worker / planner Pod"]
+        PLAN2 -->|scale up/down| PODS
+    end
+
+    subgraph DATA["数据面 data plane"]
+        direction LR
+        C(["client"]) --> FE2["dynamo.frontend"]
+        FE2 --> RT["kv_router"]
+        RT --> MG["migration"]
+        MG --> BE["dynamo.{vllm|sglang|trtllm}"]
+        BE --> KB["KVBM 多层缓存"]
+        BE -.detokenize/stream.-> FE2
+    end
+
+    OP -.创建.-> FE2
+    PLAN2 -.订阅 metrics.-> FE2
+
+    classDef ctrl fill:#fff8c5,stroke:#9a6700,color:#3d2e00;
+    classDef data fill:#ddf4ff,stroke:#0969da,color:#03285e;
+    class YAML,OP,PLAN2,PODS ctrl;
+    class C,FE2,RT,MG,BE,KB data;
+  </div>
+
+  <!-- 6 -->
+  <h2 id="deploy">6. 部署链路：CRD / Helm / Operator / Pod</h2>
+  <div class="mermaid">
+flowchart LR
+    DEV["Rust 代码 lib/"] -->|PyO3 + maturin| PYPKG["Python 包 dynamo.*"]
+    HELM["helm install"] -->|打包安装| INSTALL["Operator + CRD 装入集群"]
+    USERYAML["写 YAML<br/>kind: DynamoGraphDeployment"] -->|类型由 CRD 定义| INSTALL
+    INSTALL --> OP3["Operator 监听到资源"]
+    OP3 -->|拉起=启动| POD["Pod：frontend / worker / planner<br/>（容器里跑 python -m dynamo.*，底层是 PyO3 包的 Rust）"]
+
+    classDef rust fill:#fff1e5,stroke:#bc4c00,color:#3d1d00;
+    classDef py fill:#ddf4ff,stroke:#0969da,color:#03285e;
+    classDef go fill:#dafbe1,stroke:#1a7f37,color:#03311a;
+    class DEV rust;
+    class PYPKG,POD py;
+    class HELM,INSTALL,USERYAML,OP3 go;
+  </div>
+
+  <!-- 7 -->
+  <h2 id="glossary">7. 术语速查</h2>
+  <table>
+    <tr><th>术语</th><th>含义</th><th>在 Dynamo 的位置</th></tr>
+    <tr><td><strong>crate</strong> <span class="tag tag-rust">Rust</span></td><td>带 Cargo.toml 的 Rust 包 / 编译单元，类似 Python 的 pip 包</td><td>lib/ 下每个目录</td></tr>
+    <tr><td><strong>module</strong> <span class="tag tag-rust">Rust</span></td><td>crate 内部用 <code>mod</code> 划分的命名空间</td><td>lib/llm/src/{kv_router,preprocessor}</td></tr>
+    <tr><td><strong>trait</strong> <span class="tag tag-rust">Rust</span></td><td>类似接口：声明一组行为，<code>impl Trait for Type</code> 实现</td><td><code>AsyncEngine</code>（数据面核心）</td></tr>
+    <tr><td><strong>PyO3</strong> <span class="tag tag-rust">Rust</span><span class="tag tag-py">Py</span></td><td>把 Rust 编译成 Python 能 import 的模块</td><td>lib/bindings/python</td></tr>
+    <tr><td><strong>CRD</strong> <span class="tag tag-go">K8s</span></td><td>给 K8s 注册一种自定义资源类型</td><td>deploy/operator/api/（DynamoGraphDeployment）</td></tr>
+    <tr><td><strong>Helm</strong> <span class="tag tag-go">K8s</span></td><td>K8s 的包管理器，把成套 YAML 打包成 chart</td><td>deploy/helm/charts/</td></tr>
+    <tr><td><strong>Operator</strong> <span class="tag tag-go">K8s</span></td><td>监听 CRD 资源并落地为 Pod 的控制器</td><td>deploy/operator/（Go）</td></tr>
+    <tr><td><strong>Pod</strong> <span class="tag tag-go">K8s</span></td><td>K8s 最小运行单位，跑一个/一组容器</td><td>frontend / worker / planner 运行实例</td></tr>
+    <tr><td><strong>拉起</strong></td><td>中文工程口语：启动 / 运行起来（spin up）</td><td>Operator 拉起 Pod = 创建并启动容器</td></tr>
+  </table>
+
+  <footer>
+    本文档由对 ai-dynamo/dynamo 仓库的源码梳理生成，用于学习参考。流程图基于 Mermaid 渲染（需联网加载 CDN）。
+  </footer>
+</div>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: "default",
+    flowchart: { curve: "basis", htmlLabels: true },
+    securityLevel: "loose"
+  });
+</script>
+</body>
+</html>
