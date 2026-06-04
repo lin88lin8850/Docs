@@ -307,14 +307,12 @@ flowchart LR
   <table>
     <tr><th>术语</th><th>含义</th><th>在 Dynamo 的位置</th></tr>
     <tr><td><strong>crate</strong> <span class="tag tag-rust">Rust</span></td><td>带 Cargo.toml 的 Rust 包 / 编译单元，类似 Python 的 pip 包</td><td>lib/ 下每个目录</td></tr>
-    <tr><td><strong>module</strong> <span class="tag tag-rust">Rust</span></td><td>crate 内部用 <code>mod</code> 划分的命名空间</td><td>lib/llm/src/{kv_router,preprocessor}</td></tr>
     <tr><td><strong>trait</strong> <span class="tag tag-rust">Rust</span></td><td>类似接口：声明一组行为，<code>impl Trait for Type</code> 实现</td><td><code>AsyncEngine</code>（数据面核心）</td></tr>
     <tr><td><strong>PyO3</strong> <span class="tag tag-rust">Rust</span><span class="tag tag-py">Py</span></td><td>把 Rust 编译成 Python 能 import 的模块</td><td>lib/bindings/python</td></tr>
     <tr><td><strong>CRD</strong> <span class="tag tag-go">K8s</span></td><td>给 K8s 注册一种自定义资源类型</td><td>deploy/operator/api/（DynamoGraphDeployment）</td></tr>
     <tr><td><strong>Helm</strong> <span class="tag tag-go">K8s</span></td><td>K8s 的包管理器，把成套 YAML 打包成 chart</td><td>deploy/helm/charts/</td></tr>
     <tr><td><strong>Operator</strong> <span class="tag tag-go">K8s</span></td><td>监听 CRD 资源并落地为 Pod 的控制器</td><td>deploy/operator/（Go）</td></tr>
     <tr><td><strong>Pod</strong> <span class="tag tag-go">K8s</span></td><td>K8s 最小运行单位，跑一个/一组容器</td><td>frontend / worker / planner 运行实例</td></tr>
-    <tr><td><strong>拉起</strong></td><td>中文工程口语：启动 / 运行起来（spin up）</td><td>Operator 拉起 Pod = 创建并启动容器</td></tr>
   </table>
 
   <footer>
