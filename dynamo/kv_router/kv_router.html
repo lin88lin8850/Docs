@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dynamo Router 调用链与关键信息（打印版）</title>
+  <style>
+    :root {
+      --bg: #ffffff;
+      --panel: #ffffff;
+      --text: #111827;
+      --muted: #4b5563;
+      --accent: #2563eb;
+      --line: #d1d5db;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC",
+                   "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.55;
+    }
+    .container {
+      max-width: 1024px;
+      margin: 0 auto;
+      padding: 26px 20px 38px;
+    }
+    h1, h2, h3 {
+      margin: 0 0 10px;
+      line-height: 1.25;
+      page-break-after: avoid;
+    }
+    h1 { font-size: 28px; }
+    h2 { font-size: 21px; margin-top: 28px; }
+    h3 { font-size: 17px; margin-top: 20px; }
+    p { margin: 6px 0 10px; color: var(--muted); }
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 14px;
+      margin-top: 10px;
+      page-break-inside: avoid;
+      background: var(--panel);
+    }
+    ul, ol { margin: 6px 0 6px 20px; padding: 0; }
+    li { margin: 5px 0; }
+    code {
+      background: #f3f4f6;
+      border: 1px solid #e5e7eb;
+      border-radius: 5px;
+      padding: 1px 5px;
+      color: #111827;
+      font-size: 0.92em;
+    }
+    pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre;
+      overflow-x: auto;
+      font-size: 13px;
+      color: #1f2937;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: #fafafa;
+      margin: 8px 0;
+    }
+    pre code { background: none; border: none; padding: 0; }
+    blockquote {
+      margin: 10px 0;
+      padding: 10px 14px;
+      border-left: 4px solid var(--accent);
+      background: #eff6ff;
+      border-radius: 0 8px 8px 0;
+      color: #1e3a8a;
+    }
+    blockquote p { color: inherit; margin: 4px 0; }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 8px 0;
+      font-size: 14px;
+    }
+    th, td {
+      border: 1px solid var(--line);
+      padding: 6px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th { background: #f3f4f6; }
+    td.center, th.center { text-align: center; }
+    .footer {
+      margin-top: 24px;
+      padding-top: 10px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 13px;
+    }
+    @media print {
+      body { background: #fff; }
+      .container { max-width: none; padding: 10mm; }
+      .card, pre, table { break-inside: avoid; }
+      a[href]:after { content: ""; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Dynamo Router 调用链与关键信息</h1>
+    <p>
+      从 <code>prefill_op</code> 的 forward 入口追踪到 router 核心
+      （<code>KvRouter</code> / <code>KvPushRouter</code>）的完整调用过程与决策逻辑。
+    </p>
+
+    <blockquote>
+      <p><strong>核心结论</strong></p>
+      <p>
+        <code>KvRouter</code> 只负责<strong>选 worker</strong>，不转发；真正的端到端路由
+        （选 worker + 写回 indexer + 分发 + 生命周期）由 <code>KvPushRouter</code> 完成。
+        分离式服务下，从 <code>prefill_op</code> 出发会先后经过
+        <strong>prefill 侧</strong>和 <strong>decode 侧</strong>两个 router 核心。
+      </p>
+    </blockquote>
+
+    <h2>1) 代码分两层</h2>
+    <div class="card">
+      <table>
+        <thead>
+          <tr><th>层</th><th>路径</th><th>内容</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>算法层</strong></td>
+            <td><code>lib/kv-router/</code>（crate <code>dynamo-kv-router</code>）</td>
+            <td>纯算法 / 状态层，不依赖 runtime 的具体类型。<code>indexer/</code>（radix tree 前缀匹配）、<code>scheduling/</code>（选择器、队列、本地调度器）、<code>sequences/</code>（活跃序列 / active block 跟踪）</td>
+          </tr>
+          <tr>
+            <td><strong>集成层</strong></td>
+            <td><code>lib/llm/src/kv_router/</code></td>
+            <td>把算法层与 Dynamo runtime（discovery、NATS、pipeline）粘合。对外提供 <code>KvRouter</code>、<code>KvPushRouter</code>、<code>Indexer</code>（含远端/旁路）、<code>publisher</code>、<code>PrefillRouter</code>、<code>sticky_sessions</code> 等</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>2) 核心组件关系</h2>
+    <div class="card">
+<pre>请求 tokens
+   │
+   ▼
+KvPushRouter (端到端，含分发 / 生命周期)
+   │  调用
+   ▼
+KvRouter::find_best_match_details          ← 顶层协调
+   ├─► Indexer.find_matches_by_tier()       ← 缓存命中（device / host / disk 分层）
+   ├─► (可选) SharedKvCache.check_blocks()   ← 外部共享缓存（HiCache）
+   └─► KvScheduler.schedule()
+          └─► LocalScheduler → SchedulerQueue → WorkerSelector(cost function)
+                                    │
+                                    └─► ActiveSequencesMultiWorker(active block 跟踪)</pre>
+      <blockquote>
+        <p>缓存块由 <code>KvIndexer</code> 的全局 radix tree 维护；活跃块由 router 本地 slot manager 跟踪。</p>
+      </blockquote>
+    </div>
+
+    <h2>3) 两个核心负载指标</h2>
+    <div class="card">
+      <p>router 为每个 worker 跟踪这两类负载，共同喂给成本函数。</p>
+      <ul>
+        <li>
+          <strong>Potential Prefill Blocks（预填充成本）</strong><br />
+          新请求需从头计算的 token =（总输入 − 重叠块 × block_size）/ block_size。<br />
+          来源：<code>KvIndexer</code> 的全局前缀树（基于 worker 上报的 KV 事件）。重叠越多 → 改善 TTFT。
+        </li>
+        <li>
+          <strong>Potential Decode Blocks（解码负载）</strong><br />
+          worker 当前活跃序列占用的 block，反映其繁忙程度。<br />
+          来源：router 本地 slot manager（<code>ActiveSequencesMultiWorker</code>）。加入 +1、prefill 完成更新、释放 −1。影响 ITL。
+        </li>
+      </ul>
+    </div>
+
+    <h2>4) 算子流水线位置</h2>
+    <div class="card">
+<pre>frontend → preprocessor → migration → backend → [prefill_op] → [service_backend]</pre>
+      <p>
+        KV 模式下 <code>service_backend</code> = decode 侧 <code>KvPushRouter</code>。<br />
+        来源：<code>lib/llm/src/entrypoint/input/common.rs:369–379</code>
+      </p>
+    </div>
+
+    <h2>5) 调用链（从 prefill_op forward）</h2>
+    <div class="card">
+      <p>缩进表示嵌套调用；标 ★ 的为进入 router 核心的步骤。</p>
+      <ol>
+        <li>
+          <strong><code>PrefillRouter::generate</code></strong><br />
+          <code>prefill_op</code> 的 forward 入口。未激活 prefill → 直接走 <code>next</code>（聚合模式）；
+          否则 <code>set_phase(Prefill)</code>，克隆 <code>prefill_req</code>（<code>max_tokens=1</code>）。<br />
+          <code>lib/llm/src/kv_router/prefill_router/mod.rs:82</code>
+          <ol start="2">
+            <li>
+              <strong><code>resolve_prefill_worker(prefill_req, preselected)</code></strong><br />
+              为 Bootstrap 优化提前选 worker、拿 bootstrap（host/port/room）。无预选 worker 时调 <code>query_prefill_worker</code>。<br />
+              <code>lib/llm/src/kv_router/prefill_router/execution.rs:24</code>
+              <ol start="3">
+                <li>
+                  ★ <strong><code>KvRouter::find_best_match(update_states=false)</code></strong><br />
+                  peek 行为：只窥探最佳 worker，不预订调度槽。非 KV 模式则走 <code>SimpleRouter</code> 轮询/随机。<br />
+                  <code>execution.rs:281 → kv_router.rs:632</code>
+                </li>
+              </ol>
+            </li>
+            <li>
+              <strong><code>execute_prefill</code> / <code>spawn_prefill_task</code></strong><br />
+              真正执行 prefill。Bootstrap 路径后台 spawn，原始路径同步等待完成。<br />
+              <code>lib/llm/src/kv_router/prefill_router/execution.rs:128</code>
+              <ol start="5">
+                <li>
+                  ★ <strong><code>InnerPrefillRouter::generate_to_worker → KvPushRouter::generate</code></strong><br />
+                  prefill 侧端到端路由：请求已带 <code>prefill_worker_id</code>，走精确 pin 路径
+                  （<code>update_states=true</code> 预订槽）+ <code>inner.direct()</code> 分发。<br />
+                  <code>inner.rs:33 → push_router.rs:490</code>
+                </li>
+              </ol>
+            </li>
+            <li value="6">
+              ★ <strong><code>next.generate(decode_req) → KvPushRouter::generate</code></strong><br />
+              prefill 完成后 <code>set_phase(Decode)</code>，注入 decode override
+              （<code>overlap_score_credit=0</code>、<code>assume_kv_reuse=false</code>、<code>track_prefill_tokens=false</code>），
+              路由到 decode worker。<br />
+              <code>mod.rs:249 → service_backend (decode KvPushRouter)</code>
+            </li>
+          </ol>
+        </li>
+      </ol>
+    </div>
+
+    <h2>6) Router 核心内部：find_best_match_details</h2>
+    <div class="card">
+      <p>
+        上面 3 处核心入口最终都收敛到 <code>KvRouter::find_best_match_details</code>
+        （<code>kv_router.rs:464</code>），内部三步：
+      </p>
+      <ul>
+        <li>
+          <strong>a. <code>compute_block_hash_for_seq(tokens)</code></strong> —
+          按 <code>block_size</code> 切块并对每块 token 内容做 hash；有 LoRA 时把 adapter 名混入 hash。
+          <code>kv_router.rs:490</code>
+        </li>
+        <li>
+          <strong>b. <code>Indexer::find_matches_by_tier(block_hashes)</code></strong> —
+          在 radix tree 上做分层前缀匹配（device / host_pinned / disk），返回 per-worker 命中块数；
+          可并行查询外部 <code>SharedKvCache</code>（HiCache）。
+          <code>kv_router/indexer/mod.rs:337</code>
+        </li>
+        <li>
+          <strong>c. <code>KvScheduler::schedule → SchedulerQueue → DefaultWorkerSelector</code></strong> —
+          队列准入（容量阈值背压）→ 成本函数为每个 worker 打分 → 选最低 cost（或 softmax 采样）→
+          <code>ActiveSequences</code> 记账。
+          <code>scheduler.rs / scheduling/queue.rs / scheduling/selector.rs</code>
+        </li>
+      </ul>
+    </div>
+
+    <h2>7) 成本函数（选 worker 的核心）</h2>
+    <div class="card">
+<pre>adjusted_prefill = max(
+    raw_prefill_blocks
+    - overlap_score_credit   * device_overlap_blocks
+    - host_cache_hit_weight  * host_overlap_blocks
+    - disk_cache_hit_weight  * disk_overlap_blocks
+    - shared_cache_multiplier* shared_beyond_blocks,
+    0)
+
+cost = prefill_load_scale * adjusted_prefill + decode_blocks   // 越低越好</pre>
+      <p>
+        来源：<code>lib/kv-router/src/scheduling/selector.rs:160–168</code><br />
+        <code>temperature=0</code> 取最低 cost（并列随机）；
+        <code>temperature&gt;0</code> 对 cost 做 softmax 采样以分散负载。
+      </p>
+    </div>
+
+    <h2>8) 三个核心入口对照</h2>
+    <div class="card">
+      <table>
+        <thead>
+          <tr>
+            <th>阶段</th><th>入口</th><th>进入的核心</th>
+            <th class="center">update_states</th><th>作用</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>解析 prefill</td>
+            <td><code>query_prefill_worker</code></td>
+            <td><code>find_best_match</code></td>
+            <td class="center">false (peek)</td>
+            <td>提前选 worker 拿 bootstrap</td>
+          </tr>
+          <tr>
+            <td>执行 prefill</td>
+            <td><code>generate_to_worker</code></td>
+            <td><code>KvPushRouter::generate</code></td>
+            <td class="center">true (pin)</td>
+            <td>路由 + 分发到 prefill worker</td>
+          </tr>
+          <tr>
+            <td>执行 decode</td>
+            <td><code>next.generate</code></td>
+            <td><code>KvPushRouter::generate</code></td>
+            <td class="center">true</td>
+            <td>路由到 decode worker 生成</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>9) 事件传输模式</h2>
+    <div class="card">
+      <ul>
+        <li>
+          <strong>NATS Core / Event Plane + Local Indexer（默认）</strong><br />
+          worker 各自维护 local radix tree，通过事件面（NATS Core 或 ZMQ）发布；事件带单调递增 id。
+          router 检测序号 gap 主动向 worker 补查；worker 上线 dump 全量、下线移除其块。延迟低、部署简单。
+        </li>
+        <li>
+          <strong>JetStream（<code>--durable-kv-events</code>，opt-in）</strong><br />
+          KV 事件进持久化 JetStream，各 router replica 作为 durable consumer 消费，
+          状态经 object store 快照跨重启持久化。适合需要多副本一致性的生产环境；
+          前端与 worker 都需开启。已标记 deprecated。
+        </li>
+      </ul>
+    </div>
+
+    <h2>10) 关键配置（KvRouterConfig）</h2>
+    <div class="card">
+      <table>
+        <thead>
+          <tr><th>参数</th><th class="center">默认</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>overlap_score_credit</code></td><td class="center">1.0</td><td>device 前缀命中折扣（0~1）；0 关闭前缀匹配与事件订阅</td></tr>
+          <tr><td><code>prefill_load_scale</code></td><td class="center">1.0</td><td>扣除缓存 credit 后对 prefill 负载的缩放</td></tr>
+          <tr><td><code>host/disk_cache_hit_weight</code></td><td class="center">0.75 / 0.25</td><td>下层缓存命中折算权重</td></tr>
+          <tr><td><code>router_temperature</code></td><td class="center">0.0</td><td>&gt;0 启用 softmax 采样</td></tr>
+          <tr><td><code>use_kv_events</code></td><td class="center">true</td><td>用引擎 KV 事件；false=approximate TTL 模式</td></tr>
+          <tr><td><code>router_queue_threshold</code></td><td class="center">4.0</td><td>队列容量阈值；None 关闭队列背压</td></tr>
+          <tr><td><code>router_event_threads</code></td><td class="center">4</td><td>&gt;1 用并发 RadixTree 线程池</td></tr>
+          <tr><td><code>router_queue_policy</code></td><td class="center">fcfs</td><td>fcfs（尾部 TTFT）/ lcfs / wspt（平均 TTFT）</td></tr>
+          <tr><td><code>router_replica_sync</code></td><td class="center">false</td><td>多 router 活跃块状态同步</td></tr>
+        </tbody>
+      </table>
+      <p>
+        来源：<code>lib/kv-router/src/scheduling/config.rs</code> ·
+        多数参数还可通过 <code>RouterConfigOverride</code> 逐请求覆盖。
+      </p>
+    </div>
+
+    <div class="footer">
+      打印建议：浏览器中选择“打印” -&gt; “另存为 PDF”，保留背景图形可提升图表可读性。
+    </div>
+  </div>
+</body>
+</html>

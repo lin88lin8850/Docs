@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dynamo Router ↔ KVBM Offload 对接架构（打印版）</title>
+  <style>
+    :root {
+      --bg: #ffffff;
+      --panel: #ffffff;
+      --text: #111827;
+      --muted: #4b5563;
+      --accent: #2563eb;
+      --line: #d1d5db;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC",
+                   "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.55;
+    }
+    .container {
+      max-width: 1024px;
+      margin: 0 auto;
+      padding: 26px 20px 38px;
+    }
+    h1, h2, h3 {
+      margin: 0 0 10px;
+      line-height: 1.25;
+      page-break-after: avoid;
+    }
+    h1 { font-size: 28px; }
+    h2 { font-size: 21px; margin-top: 28px; }
+    h3 { font-size: 17px; margin-top: 20px; }
+    p { margin: 6px 0 10px; color: var(--muted); }
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 14px;
+      margin-top: 10px;
+      page-break-inside: avoid;
+      background: var(--panel);
+    }
+    ul, ol { margin: 6px 0 6px 20px; padding: 0; }
+    li { margin: 5px 0; }
+    code {
+      background: #f3f4f6;
+      border: 1px solid #e5e7eb;
+      border-radius: 5px;
+      padding: 1px 5px;
+      color: #111827;
+      font-size: 0.92em;
+    }
+    pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre;
+      overflow-x: auto;
+      font-size: 13px;
+      color: #1f2937;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: #fafafa;
+      margin: 8px 0;
+    }
+    pre code { background: none; border: none; padding: 0; }
+    blockquote {
+      margin: 10px 0;
+      padding: 10px 14px;
+      border-left: 4px solid var(--accent);
+      background: #eff6ff;
+      border-radius: 0 8px 8px 0;
+      color: #1e3a8a;
+    }
+    blockquote p { color: inherit; margin: 4px 0; }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 8px 0;
+      font-size: 14px;
+    }
+    th, td {
+      border: 1px solid var(--line);
+      padding: 6px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th { background: #f3f4f6; }
+    .mermaid {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      overflow-x: auto;
+      background: #fff;
+    }
+    .footer {
+      margin-top: 24px;
+      padding-top: 10px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 13px;
+    }
+    @media print {
+      body { background: #fff; }
+      .container { max-width: none; padding: 10mm; }
+      .card, .mermaid, pre, table { break-inside: avoid; }
+      a[href]:after { content: ""; }
+    }
+  </style>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "base",
+      securityLevel: "loose",
+      sequence: { showSequenceNumbers: true }
+    });
+  </script>
+</head>
+<body>
+  <div class="container">
+    <h1>Dynamo Router ↔ KVBM Offload 对接架构</h1>
+    <blockquote>
+      <p>
+        基于 ai-dynamo/dynamo 代码库探索整理
+        （<code>lib/kv-router</code>、<code>lib/llm/src/kv_router</code>、<code>lib/llm/src/block_manager</code>）。<br />
+        整理日期：2026-06-12
+      </p>
+    </blockquote>
+
+    <h2>总览</h2>
+    <div class="card">
+      <p>
+        Router（KV-aware routing）与 Offload（KVBM 分层 KV cache）之间<strong>没有直接函数调用</strong>，
+        而是通过 <strong>KV cache 事件总线</strong>异步耦合：Offload 状态变化以 Store/Remove 事件经
+        Consolidator 汇聚后发布到 event plane，Router indexer 订阅并按 storage tier 更新索引。
+      </p>
+      <p><strong>关键结论：</strong></p>
+      <ol>
+        <li>Offload 完成后<strong>不会</strong>直接回调 Router；Router 通过 <strong>Store/Remove KV 事件</strong>感知状态。</li>
+        <li>Router <strong>能感知 storage tier</strong>（<code>StorageTier</code>: Device / HostPinned / Disk / External），通过 <code>RouterEvent.storage_tier</code> 和 <code>medium</code> 字段路由到不同 indexer。</li>
+        <li>默认 <strong>Dedup</strong> 模式下，Consolidator 把跨 G1/G2/G3 的 block 统一视为 <strong>Device-tier 逻辑存在</strong>，直到<strong>所有 source 都 remove</strong> 才向 Router 发 REMOVE；因此 GPU 驱逐但 G2/G3 仍保留时，Router 的 device indexer <strong>继续认为 block 在该 worker 上</strong>。</li>
+        <li><strong>Passthrough</strong> 模式会保留 <code>tier</code>，lower-tier indexer 可单独记录 host/disk 命中，配合 <code>host_cache_hit_weight</code> / <code>disk_cache_hit_weight</code> 参与选 worker。</li>
+      </ol>
+    </div>
+
+    <h2>1) 整体架构（组件 + 数据流）</h2>
+    <div class="card">
+      <div class="mermaid">
+flowchart TB
+    subgraph ROUTE["路由决策路径"]
+        CLIENT["Client&lt;br/&gt;HTTP 请求"]
+        FE["Frontend · KvPushRouter&lt;br/&gt;generate → select_worker"]
+        KR["KvRouter&lt;br/&gt;find_best_match_details"]
+        IDX["Router Indexer&lt;br/&gt;device radix + LowerTierIndexers"]
+        SCHED["KvScheduler · Selector&lt;br/&gt;tier overlap credit 成本函数"]
+    end
+
+    subgraph WK["Worker / KVBM Offload"]
+        WORKER["vLLM / TRT-LLM Worker&lt;br/&gt;G1 GPU KV blocks"]
+        KVBM["KVBM OffloadManager&lt;br/&gt;D2H / H2Disk → G2 / G3"]
+    end
+
+    subgraph EVT["KV 事件管道"]
+        CONSOL["KvEventConsolidator&lt;br/&gt;Dedup / Passthrough"]
+        CPUB["Consolidator Publisher&lt;br/&gt;ZMQ · medium=GPU/CPU/DISK"]
+        KPUB["KvEventPublisher&lt;br/&gt;zmq_listener → event_processor"]
+        PLANE["Event Plane&lt;br/&gt;kv-events subject (NATS/ZMQ)"]
+    end
+
+    CLIENT --> FE
+    FE -->|token block hashes| KR
+    KR -->|find_matches_by_tier| IDX
+    IDX -->|TieredMatchDetails| SCHED
+    SCHED -.->|best worker| FE
+    FE -->|dispatch 请求| WORKER
+
+    WORKER -->|ZMQ G1 Store/Remove 事件| CONSOL
+    WORKER -->|connector offload| KVBM
+    KVBM -->|"handle_store/remove (G2/G3 tier)"| CONSOL
+
+    CONSOL -->|去重 / 透传| CPUB
+    CPUB -->|ZMQ · medium| KPUB
+    KPUB -->|RouterEvent 批量| PLANE
+    PLANE -->|subscriber → apply_event 按 tier 更新| IDX
+
+    style SCHED stroke:#599CE7
+    style KR stroke:#599CE7
+    style IDX stroke:#599CE7
+    style FE stroke:#599CE7
+    style CONSOL stroke:#1F8A65
+    style CPUB stroke:#1F8A65
+    style KPUB stroke:#1F8A65
+    style PLANE stroke:#1F8A65
+      </div>
+    </div>
+
+    <h2>2) 完整时序图（请求 → Offload → Router 感知闭环）</h2>
+    <div class="card">
+      <div class="mermaid">
+sequenceDiagram
+    participant Client
+    participant Frontend as Frontend/KvPushRouter
+    participant Router as KvRouter+Scheduler
+    participant Indexer as Router Indexer
+    participant Worker as vLLM Worker
+    participant KVBM as KVBM OffloadManager
+    participant Consol as KvEventConsolidator
+    participant Pub as KvEventPublisher
+    participant Bus as Event Plane (kv-events)
+
+    Client->>Frontend: HTTP request
+    Frontend->>Router: find_best_match_details(tokens)
+    Router->>Indexer: find_matches_by_tier(block_hashes)
+    Indexer-->>Router: TieredMatchDetails
+    Router->>Router: schedule(worker, tier_overlap, load)
+    Router-->>Frontend: best worker
+    Frontend->>Worker: dispatch request
+
+    Worker->>Worker: prefill/decode, GPU KV blocks
+    Worker->>Consol: ZMQ G1 Store/Remove events
+    Worker->>KVBM: connector schedules offload
+    KVBM->>KVBM: D2H / H2Disk transfer
+    KVBM->>KVBM: host/disk pool register_blocks
+    KVBM->>Consol: handle_store/remove (EventSource::Kvbm, tier)
+    Consol->>Consol: dedup by SequenceHash
+    Consol->>Pub: ZMQ consolidated events (medium)
+    Pub->>Pub: batch + convert → RouterEvent
+    Pub->>Bus: publish kv-events
+    Bus->>Indexer: subscriber / handle_live_event
+    Indexer->>Indexer: apply_event (tier-routed)
+
+    Note over Client,Indexer: 后续请求再次进入 find_best_match_details，使用更新后的 indexer 状态
+      </div>
+    </div>
+
+    <h3>分阶段说明</h3>
+    <div class="card">
+      <p><strong>A. 请求进入 → Router 决策</strong></p>
+      <ol>
+        <li><code>KvPushRouter::generate</code> → <code>select_worker</code></li>
+        <li><code>KvRouter::find_best_match_details</code>：算 token block hashes → <code>Indexer::find_matches_by_tier</code> → 加权 cache hit → <code>KvScheduler::schedule</code> → <code>DefaultWorkerSelector::select_worker</code></li>
+        <li>非 query-only 时更新 active sequences（prefill/decode load tracking）</li>
+      </ol>
+
+      <p><strong>B. Worker 执行 → Offload 触发</strong></p>
+      <ol>
+        <li>vLLM 在 GPU 上产生 KV blocks，通过 engine ZMQ 发 G1 事件</li>
+        <li><code>ManagedBlockPool::register_blocks</code> 注册 immutable block</li>
+        <li>若 <code>offload_priority</code> 存在 → <code>enqueue_offload</code> → <code>OffloadManager</code> worker 线程执行 D2H/H2Disk</li>
+        <li>Host/Disk pool 再次 <code>register_blocks</code></li>
+      </ol>
+
+      <p><strong>C. 状态更新 → Router 感知</strong></p>
+      <ol>
+        <li><code>DynamoEventManager</code> → <code>KvEventConsolidatorHandle::handle_store/remove</code></li>
+        <li><code>DedupCacheStatusTracker</code>：首 store 发 STORE；末 source remove 发 REMOVE</li>
+        <li><code>KvEventConsolidatorPublisher</code> → ZMQ（<code>medium</code> 字段）</li>
+        <li>Worker <code>KvEventPublisher</code> 的 <code>zmq_listener</code> 收 batch → <code>event_processor</code> 批处理</li>
+        <li><code>sinks::emit</code> 发布 <code>RouterEvent</code> 到 <code>kv-events</code> subject</li>
+        <li>Router <code>start_subscriber</code> 收事件 → <code>handle_live_event</code> → <code>Indexer::apply_event</code></li>
+      </ol>
+
+      <p><strong>D. Router 后续决策</strong></p>
+      <ul>
+        <li>下一次请求的 <code>find_matches_by_tier</code> 使用更新后的 radix tree / lower-tier continuation</li>
+        <li>GPU 仍可见（Dedup）或 host/disk tier 单独计分（Passthrough/tier-tagged events）</li>
+        <li>Scheduler 的 decode/prefill load 由 active sequence 事件独立维护，与 offload 并行</li>
+      </ul>
+    </div>
+
+    <h2>3) Consolidation 模式对 Router 的影响</h2>
+    <div class="card">
+      <div class="mermaid">
+flowchart LR
+    EV["KV 事件&lt;br/&gt;(G1 GPU / G2 Host / G3 Disk)"] --> MODE{KvEventConsolidationMode}
+
+    MODE -->|Dedup 默认| D1["统一打 Device tier&lt;br/&gt;首个 source store 发 STORE"]
+    D1 --> D2["所有 source remove 才发 REMOVE&lt;br/&gt;GPU 驱逐但 G2/G3 保留 → 不发 REMOVE"]
+    D2 --> D3["Router device indexer&lt;br/&gt;视为 block 仍在 worker 上"]
+
+    MODE -->|Passthrough| P1["保留原始 tier (medium)"]
+    P1 --> P2["非 GPU tier → LowerTierIndexers&lt;br/&gt;device → host → disk 链式匹配"]
+    P2 --> P3["host/disk_cache_hit_weight&lt;br/&gt;参与 worker 打分"]
+      </div>
+    </div>
+
+    <h2>4) Selector 成本函数（含 tier credit）</h2>
+    <div class="card">
+<pre>overlap_credit = overlap_score_credit × device
+              + host_cache_hit_weight × host_pinned
+              + disk_cache_hit_weight × disk
+              + shared
+prefill_blocks = max(raw_prefill − overlap_credit, 0)
+logit          = prefill_cost + decode_cost        // 越小越优</pre>
+      <p>见 <code>lib/kv-router/src/scheduling/selector.rs</code> 的 <code>DefaultWorkerSelector::worker_logit</code>。</p>
+    </div>
+
+    <h2>5) 交互数据结构</h2>
+    <div class="card">
+      <table>
+        <thead>
+          <tr><th>结构</th><th>定义位置</th><th>方向</th><th>含义</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>StoreEventInput</code> / <code>RemoveEventInput</code></td><td><code>kv_consolidator/tracker.rs</code></td><td>KVBM → Consolidator</td><td>block_hash + source=Kvbm + tier</td></tr>
+          <tr><td><code>ConsolidatedEvent::{Store,Remove,ClearAll}</code></td><td><code>kv_consolidator/tracker.rs</code></td><td>Consolidator 内部队列</td><td>去重后的对外事件</td></tr>
+          <tr><td><code>Event::BlockStored { medium }</code></td><td><code>kv_consolidator/publisher.rs</code></td><td>Consolidator → ZMQ</td><td>medium = GPU / CPU_TIER1 / CPU_TIER2</td></tr>
+          <tr><td><code>PlacementEvent</code></td><td><code>kv-router/src/protocols.rs</code></td><td>Worker publisher 内部</td><td>placement.tier + KvCacheEvent</td></tr>
+          <tr><td><code>RouterEvent</code></td><td><code>kv-router/src/protocols.rs</code></td><td>Worker → Event plane → Router</td><td>worker_id + storage_tier + event</td></tr>
+          <tr><td><code>TierOverlapBlocks</code></td><td><code>kv-router/src/scheduling/types.rs</code></td><td>Indexer → Scheduler</td><td>device / host_pinned / disk 每 worker 命中数</td></tr>
+          <tr><td><code>SchedulingRequest</code></td><td><code>kv-router/src/scheduling/types.rs</code></td><td>Router → Selector</td><td>tier_overlap + effective_overlap</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>6) 关键配置</h2>
+    <div class="card">
+      <table>
+        <thead>
+          <tr><th>配置</th><th>位置</th><th>作用</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>--router-mode kv</code></td><td>frontend</td><td>启用 KV-aware routing</td></tr>
+          <tr><td><code>--router-kv-events</code> / <code>use_kv_events</code></td><td><code>KvRouterConfig</code></td><td>是否消费 worker KV 事件</td></tr>
+          <tr><td><code>--router-kv-overlap-score-credit</code></td><td><code>KvRouterConfig</code></td><td>GPU prefix overlap 权重</td></tr>
+          <tr><td><code>host_cache_hit_weight</code> / <code>disk_cache_hit_weight</code></td><td><code>kv-router/src/scheduling/config.rs</code></td><td>CPU / disk tier 命中权重</td></tr>
+          <tr><td><code>DYN_KVBM_KV_EVENTS_ENABLE_CONSOLIDATOR</code></td><td><code>consolidator_config.py</code></td><td>是否启用 Consolidator</td></tr>
+          <tr><td><code>DYN_KVBM_CPU_CACHE_GB</code> / <code>DYN_KVBM_DISK_CACHE_GB</code></td><td><code>block_manager/config.rs</code></td><td>G2 / G3 容量，影响 bypass CPU</td></tr>
+          <tr><td><code>DYN_KVBM_LEADER_ZMQ_PUB_PORT</code></td><td>consolidator endpoints</td><td>Consolidator 输出 ZMQ 端口</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>7) 代码地图</h2>
+    <h3>Router 侧</h3>
+    <div class="card">
+      <table>
+        <thead>
+          <tr><th>文件 / 模块</th><th>关键内容</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>lib/kv-router/src/protocols.rs</code></td><td><code>StorageTier</code>, <code>KvCacheEvent</code>, <code>RouterEvent</code>, <code>KV_EVENT_SUBJECT</code></td></tr>
+          <tr><td><code>lib/kv-router/src/indexer/</code></td><td><code>KvIndexer</code>, <code>LowerTierIndexers</code>, <code>TieredMatchDetails</code></td></tr>
+          <tr><td><code>lib/kv-router/src/scheduling/</code></td><td><code>LocalScheduler</code>, <code>DefaultWorkerSelector</code>, <code>TierOverlapBlocks</code>, <code>KvRouterConfig</code></td></tr>
+          <tr><td><code>lib/kv-router/src/zmq_wire/convert.rs</code></td><td><code>convert_event</code>：medium → StorageTier → PlacementEvent</td></tr>
+          <tr><td><code>lib/llm/src/kv_router.rs</code></td><td><code>KvRouter</code>, <code>find_best_match_details</code>, <code>cache_hit_weight_for_tier</code></td></tr>
+          <tr><td><code>lib/llm/src/kv_router/push_router.rs</code></td><td><code>KvPushRouter</code>, <code>select_worker</code>, <code>AsyncEngine::generate</code></td></tr>
+          <tr><td><code>lib/llm/src/kv_router/indexer/</code></td><td><code>find_matches_by_tier</code>, <code>apply_event</code>, <code>start_subscriber</code>, <code>handle_live_event</code></td></tr>
+          <tr><td><code>lib/llm/src/kv_router/publisher/</code></td><td><code>KvEventPublisher</code>：zmq_listener → event_processor → sinks::emit</td></tr>
+          <tr><td><code>lib/bindings/python/rust/llm/kv.rs</code></td><td><code>KvRouter</code> / <code>KvPushRouter</code> / <code>KvEventPublisher</code> PyO3 绑定</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Offload 侧（KVBM）</h3>
+    <div class="card">
+      <table>
+        <thead>
+          <tr><th>文件 / 模块</th><th>关键内容</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>lib/llm/src/block_manager/offload.rs</code></td><td><code>OffloadManager</code>：D2H / H2D / H2Disk / D2D workers</td></tr>
+          <tr><td><code>lib/llm/src/block_manager/pool/managed/state.rs</code></td><td><code>register_blocks</code> → <code>enqueue_offload</code>（offload 触发点）</td></tr>
+          <tr><td><code>lib/llm/src/block_manager/events.rs</code></td><td><code>DynamoEventManager::publish_store_events</code> → <code>handle_store</code></td></tr>
+          <tr><td><code>lib/llm/src/block_manager/kv_consolidator/</code></td><td><code>KvEventConsolidator</code>：tracker（Dedup/Passthrough）+ ZMQ publisher</td></tr>
+          <tr><td><code>lib/llm/src/block_manager/config.rs</code></td><td><code>should_bypass_cpu_cache()</code>：G1 → G3 直传</td></tr>
+          <tr><td><code>lib/bindings/kvbm/.../connector/leader/slot.rs</code></td><td><code>process_offload_request</code>（G1→G2 或 G1→G3）</td></tr>
+          <tr><td><code>lib/bindings/kvbm/python/kvbm/vllm_integration/consolidator_config.py</code></td><td><code>should_enable_consolidator</code>, <code>get_consolidator_endpoints</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>8) 测试与文档参考</h2>
+    <div class="card">
+      <table>
+        <thead>
+          <tr><th>路径</th><th>用途</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>tests/kvbm_integration/test_consolidator_router_e2e.py</code></td><td>Consolidator + Router E2E；STORE/REMOVE dedup 跨 G1/G2/G3</td></tr>
+          <tr><td><code>tests/router/test_router_e2e_with_vllm.py</code></td><td>Router E2E</td></tr>
+          <tr><td><code>examples/backends/vllm/launch/agg_kvbm_router.sh</code></td><td>Aggregated + KV routing + KVBM</td></tr>
+          <tr><td><code>docs/design-docs/router-design.md</code></td><td>Router 设计</td></tr>
+          <tr><td><code>docs/design-docs/kvbm-design.md</code></td><td>KVBM 分层与数据流</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="footer">
+      打印建议：浏览器中选择“打印” -&gt; “另存为 PDF”，保留背景图形可提升图表可读性。
+    </div>
+  </div>
+</body>
+</html>
